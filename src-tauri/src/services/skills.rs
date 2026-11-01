@@ -125,11 +125,12 @@ pub fn parse_skill_markdown(content: &str, fallback_id: &str) -> Result<SkillDef
         steps,
         source: "user".to_string(),
         enabled: true,
+        body: Some(body.to_string()),
     })
 }
 
-pub fn parse_skill(content: &str) -> Result<SkillDef, String> {
-    parse_skill_with_stem(content, "custom-skill")
+pub fn parse_skill(content: &str, fallback_id: &str) -> Result<SkillDef, String> {
+    parse_skill_with_stem(content, fallback_id)
 }
 
 pub fn parse_skill_with_stem(content: &str, stem: &str) -> Result<SkillDef, String> {
@@ -164,6 +165,7 @@ pub fn parse_skill_with_stem(content: &str, stem: &str) -> Result<SkillDef, Stri
                 steps: legacy.steps,
                 source: "user".to_string(),
                 enabled: true,
+                body: None,
             });
         }
     }
@@ -353,9 +355,14 @@ pub fn load_user_skills(app: &AppHandle) -> Vec<SkillDef> {
     }
 
     // 2. 扫描系统全局目录 (如 npx skills add -g 安装的 ~/.skills/)
+    let enabled_globals = load_enabled_global_skills(app);
     for global_dir in global_skills_dirs(app) {
-        for s in scan_skills_in_dir(&global_dir, "global") {
+        for mut s in scan_skills_in_dir(&global_dir, "global") {
             if seen_ids.insert(s.id.clone()) {
+                // 用户显式启用过的全局技能恢复 enabled
+                if enabled_globals.contains(&s.id) {
+                    s.enabled = true;
+                }
                 out.push(s);
             }
         }
@@ -364,8 +371,61 @@ pub fn load_user_skills(app: &AppHandle) -> Vec<SkillDef> {
     out
 }
 
+// ---------- 全局技能启用持久化 ----------
+
+const ENABLED_GLOBAL_SKILLS_KEY: &str = "enabled_global_skills";
+
+/// 读取用户已显式启用的全局技能 id 列表
+pub fn load_enabled_global_skills(app: &AppHandle) -> Vec<String> {
+    let state = app.state::<AppState>();
+    let Ok(conn) = state.db() else {
+        return Vec::new();
+    };
+    settings::get(&conn, ENABLED_GLOBAL_SKILLS_KEY)
+        .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+        .unwrap_or_default()
+}
+
+/// 将某个全局技能标记为已启用（持久化到 settings）
+pub fn enable_global_skill(app: &AppHandle, id: &str) -> Result<(), String> {
+    let safe_id = sanitize_skill_id(id.trim());
+    if safe_id.is_empty() {
+        return Err("非法或空的 Skill id".to_string());
+    }
+    // 仅允许启用真实存在且 source == "global" 的技能
+    let exists = load_user_skills(app)
+        .iter()
+        .any(|s| s.id == safe_id && s.source == "global");
+    if !exists {
+        return Err(format!("全局 Skill 不存在: {safe_id}"));
+    }
+    let mut list = load_enabled_global_skills(app);
+    if !list.contains(&safe_id) {
+        list.push(safe_id);
+    }
+    let state = app.state::<AppState>();
+    let conn = state.db()?;
+    let v = serde_json::to_string(&list).map_err(|e| format!("序列化失败: {e}"))?;
+    settings::set(&conn, ENABLED_GLOBAL_SKILLS_KEY, &v)
+}
+
 pub fn save_user_skill(app: &AppHandle, yaml: &str) -> Result<SkillDef, String> {
-    let def = parse_skill(yaml)?;
+    // 无 id 且已有同名回退文件时拒绝保存，避免互相覆盖
+    let probe_dir = user_skills_dir(app)?;
+    let has_id = serde_yml::from_str::<serde_yml::Value>(yaml)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string)))
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
+    let stem_provided = yaml.trim_start().starts_with("---");
+    if !has_id && stem_provided {
+        let fallback_file = probe_dir.join("custom-skill.md");
+        if fallback_file.exists() {
+            return Err("缺少 id 且已存在 custom-skill 技能：请为该技能补充唯一 id 后再保存".to_string());
+        }
+    }
+
+    let def = parse_skill(yaml, "custom-skill")?;
     // 文件名净化：仅保留安全字符，避免路径穿越
     let safe_id: String = def
         .id
@@ -380,6 +440,13 @@ pub fn save_user_skill(app: &AppHandle, yaml: &str) -> Result<SkillDef, String> 
     let file_name = format!("{safe_id}.md");
     std::fs::write(dir.join(file_name), yaml)
         .map_err(|e| format!("写入 Skill 失败: {e}"))?;
+    // 同步清理同名遗留 .yaml / .yml，避免新旧双版本并存
+    for ext in ["yaml", "yml"] {
+        let legacy = dir.join(format!("{safe_id}.{ext}"));
+        if legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
     let mut saved = def;
     saved.source = "user".to_string();
     Ok(saved)
@@ -396,12 +463,14 @@ pub fn delete_user_skill(app: &AppHandle, id: &str) -> Result<(), String> {
     }
     let canon_dir = dir.canonicalize().map_err(|e| format!("无法解析目录路径: {e}"))?;
 
-    // 1. 删除单文件 <id>.md
-    let file_path = dir.join(format!("{safe_id}.md"));
-    if file_path.exists() {
-        if let Ok(canon_file) = file_path.canonicalize() {
-            if canon_file.starts_with(&canon_dir) && canon_file != canon_dir {
-                return std::fs::remove_file(&canon_file).map_err(|e| format!("删除失败: {e}"));
+    // 1. 删除单文件 <id>.md 以及遗留 <id>.yaml / .yml
+    for ext in ["md", "yaml", "yml"] {
+        let file_path = dir.join(format!("{safe_id}.{ext}"));
+        if file_path.exists() {
+            if let Ok(canon_file) = file_path.canonicalize() {
+                if canon_file.starts_with(&canon_dir) && canon_file != canon_dir {
+                    return std::fs::remove_file(&canon_file).map_err(|e| format!("删除失败: {e}"));
+                }
             }
         }
     }
@@ -729,10 +798,12 @@ mod tests {
     #[test]
     fn validation_catches_bad_skill() {
         // B2/S1: 针对 parse_skill_markdown 的真实字段与格式校验
-        assert!(parse_skill("not markdown or yaml").is_err());
-        assert!(parse_skill("---\nid: \"\"\nname: \"\"\n---\nbody").is_err());
-        assert!(parse_skill("---\nid: valid-id\nname: \"\"\n---\nbody").is_err());
-        assert!(parse_skill("---\nid: \"invalid/id/with/slash\"\nname: Test\n---\nbody").is_err());
-        assert!(parse_skill("---\nname: MissingIdFallback\n---\nbody").is_ok());
+        assert!(parse_skill("not markdown or yaml", "stem").is_err());
+        assert!(parse_skill("---\nid: \"\"\nname: \"\"\n---\nbody", "stem").is_err());
+        assert!(parse_skill("---\nid: valid-id\nname: \"\"\n---\nbody", "stem").is_err());
+        assert!(parse_skill("---\nid: \"invalid/id/with/slash\"\nname: Test\n---\nbody", "stem").is_err());
+        let ok = parse_skill("---\nname: MissingIdFallback\n---\nbody", "fallback-stem").unwrap();
+        assert_eq!(ok.id, "fallback-stem");
+        assert_eq!(ok.body.as_deref(), Some("body"));
     }
 }

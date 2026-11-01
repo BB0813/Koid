@@ -297,6 +297,8 @@ export interface SkillDef {
   /** builtin / user */
   source: 'builtin' | 'user' | 'global'
   enabled: boolean
+  /** 标准 SKILL.md 正文（全局技能运行前需用户确认） */
+  body?: string | null
 }
 
 export type SkillEventKind =

@@ -8,15 +8,23 @@ import {
   Play,
   Plus,
   Pencil,
+  ShieldAlert,
   Sparkles,
   Trash2,
 } from 'lucide-vue-next'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import SkillRunDialog from './components/SkillRunDialog.vue'
 import SkillEditorDialog from './components/SkillEditorDialog.vue'
 import { useSkillStore } from '@/stores/skills'
-import { toApiError } from '@/lib/api'
+import { skillsApi, toApiError } from '@/lib/api'
 import type { SkillDef } from '@/types'
 
 const { t } = useI18n()
@@ -32,6 +40,8 @@ onMounted(async () => {
 
 const runSkill = ref<SkillDef | null>(null)
 const runOpen = ref(false)
+const trustSkill = ref<SkillDef | null>(null)
+const trustOpen = ref(false)
 const editSkill = ref<SkillDef | null>(null)
 const editOpen = ref(false)
 
@@ -46,8 +56,26 @@ function iconOf(s: SkillDef) {
 }
 
 function openRun(s: SkillDef) {
+  // 默认禁用的全局技能：先展示其完整正文，确认可信后才持久化启用
+  if (s.source === 'global' && !s.enabled) {
+    trustSkill.value = s
+    trustOpen.value = true
+    return
+  }
   runSkill.value = s
   runOpen.value = true
+}
+
+async function confirmTrust() {
+  if (!trustSkill.value) return
+  try {
+    await skillsApi.enableGlobal(trustSkill.value.id)
+    await store.load()
+    trustOpen.value = false
+    trustSkill.value = null
+  } catch (e) {
+    toast.error(toApiError(e).message)
+  }
 }
 
 function openAdd() {
@@ -156,5 +184,31 @@ const sorted = computed(() =>
 
     <SkillRunDialog v-model:open="runOpen" :skill="runSkill" />
     <SkillEditorDialog v-model:open="editOpen" :skill="editSkill" @saved="() => {}" />
+
+    <!-- 全局技能启用确认：展示完整正文，用户审阅后持久化启用 -->
+    <Dialog :open="trustOpen" @update:open="(v: boolean) => (trustOpen = v)">
+      <DialogContent class="flex max-h-[80vh] max-w-2xl flex-col overflow-hidden">
+        <DialogHeader>
+          <DialogTitle class="flex items-center gap-2">
+            <ShieldAlert class="size-4 text-destructive" />
+            {{ t('skills.enableGlobalTitle') }} · {{ trustSkill?.name }}
+          </DialogTitle>
+        </DialogHeader>
+        <div class="min-h-0 flex-1 space-y-3 overflow-y-auto py-1">
+          <p class="text-sm text-muted-foreground">{{ t('skills.globalTrustHint') }}</p>
+          <pre
+            class="whitespace-pre-wrap rounded-lg border bg-muted/30 px-3 py-2 font-mono text-xs leading-5"
+          >{{ trustSkill?.body || t('skills.empty') }}</pre>
+        </div>
+        <DialogFooter class="pt-3">
+          <Button variant="outline" @click="trustOpen = false">
+            {{ t('common.cancel') }}
+          </Button>
+          <Button @click="() => void confirmTrust()">
+            {{ t('skills.enableGlobal') }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>
