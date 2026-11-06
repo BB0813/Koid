@@ -612,6 +612,10 @@ impl ToolAccumulator {
         &mut self.items[idx]
     }
 
+    fn set_arguments(&mut self, idx: usize, args: &str) {
+        self.ensure(idx).arguments = args.to_string();
+    }
+
     /// OpenAI 流式 delta：{ index, id?, function:{name?, arguments?} }
     fn apply_openai_delta(&mut self, delta: &Value) {
         let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) else {
@@ -1009,20 +1013,14 @@ pub(crate) fn handle_openai_response_line(
                 }
             }
         }
-        // 工具项结束：部分端点只在 done 事件里给出完整 arguments
+        // 工具项结束：done 携带完整 arguments，用替换而非追加（delta 已拼完时避免重复拼接）
         "response.output_item.done" => {
             if let Some(item) = v.get("item") {
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let item_idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
                     if let Some(args) = item.get("arguments").and_then(Value::as_str) {
                         if !args.is_empty() {
-                            let fake_delta = json!({
-                                "tool_calls": [{
-                                    "index": item_idx,
-                                    "function": { "arguments": args }
-                                }]
-                            });
-                            tools.apply_openai_delta(&fake_delta);
+                            let item_idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            tools.set_arguments(item_idx, args);
                         }
                     }
                 }
@@ -1405,6 +1403,63 @@ mod tests {
         assert_eq!(u.prompt_tokens, 11);
         assert_eq!(u.completion_tokens, 7);
         assert_eq!(u.total_tokens, 18);
+    }
+
+    #[test]
+    fn openai_response_api_sse_done_replaces_arguments() {
+        // 官方事件序列：delta 已拼完全部参数后，done 又携带完整 arguments，
+        // 必须替换而非追加，否则参数变成非法 JSON 导致工具拿不到参数
+        let (sink, _buf) = sink_capture();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut tools = ToolAccumulator::default();
+
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":""}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":"}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"a.txt\"}"}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+
+        let calls = tools.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.txt\"}");
+    }
+
+    #[test]
+    fn openai_response_api_sse_done_only_arguments() {
+        // 部分端点不发 delta，只在 done 事件给出完整 arguments
+        let (sink, _buf) = sink_capture();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut tools = ToolAccumulator::default();
+
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":""}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+
+        let calls = tools.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.txt\"}");
     }
 
     #[test]
