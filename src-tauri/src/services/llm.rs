@@ -8,7 +8,9 @@
 //! NETWORK / TIMEOUT / UNAUTHORIZED / RATE_LIMITED / SERVER / BAD_REQUEST /
 //! EMPTY / ABORTED / UNSUPPORTED，前端按 CODE 映射 i18n 提示（§7.2）
 
-use crate::models::{ChatRequest, ChatResponse, GlobalProxy, Provider, TokenUsage};
+use crate::models::{
+    ChatRequest, ChatResponse, GlobalProxy, Provider, ProviderType, TokenUsage,
+};
 use crate::services::proxy::{build_client, resolve_proxy};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -46,6 +48,15 @@ fn openai_chat_url(base: &str) -> String {
         format!("{b}/chat/completions")
     } else {
         format!("{b}/v1/chat/completions")
+    }
+}
+
+fn openai_responses_url(base: &str) -> String {
+    let b = base.trim_end_matches('/');
+    if b.ends_with("/v1") {
+        format!("{b}/responses")
+    } else {
+        format!("{b}/v1/responses")
     }
 }
 
@@ -361,13 +372,141 @@ fn parse_usage(v: &Value) -> Option<TokenUsage> {
 
 // ---------- 主入口 ----------
 
+/// OpenAI Response API (/v1/responses) 请求体构造（纯函数，便于单测）
+fn build_openai_response_body(req: &ChatRequest) -> Value {
+    // 构造 input：Responses API 使用类型化条目（message / function_call / function_call_output）
+    let mut input: Vec<Value> = Vec::new();
+    if let Some(sys) = &req.system {
+        if !sys.trim().is_empty() {
+            input.push(json!({ "type": "message", "role": "system", "content": sys }));
+        }
+    }
+    for m in &req.messages {
+        // 工具结果消息 → function_call_output（按 call_id 配对）
+        if m.role == "tool" {
+            let call_id = m.tool_call_id.clone().unwrap_or_default();
+            if call_id.is_empty() {
+                continue;
+            }
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": m.content,
+            }));
+            continue;
+        }
+        // assistant 的工具调用 → function_call 条目（Responses API 不接受 Chat 的 tool_calls 字段）
+        if let Some(tc) = &m.tool_calls {
+            let calls = tc.as_array().cloned().unwrap_or_default();
+            for call in calls {
+                let call_id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let arguments = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                if name.is_empty() {
+                    continue;
+                }
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }));
+            }
+            // assistant 文本内容单独作为一条 message
+            if !m.content.trim().is_empty() {
+                input.push(json!({ "type": "message", "role": "assistant", "content": m.content }));
+            }
+            continue;
+        }
+        let role = match m.role.as_str() {
+            "developer" | "user" | "assistant" | "system" => m.role.clone(),
+            _ => "user".to_string(),
+        };
+        input.push(json!({ "type": "message", "role": role, "content": m.content }));
+    }
+
+    let mut body = json!({
+        "model": req.model_id,
+        "input": input,
+        "stream": req.stream,
+    });
+
+    let is_reasoning = is_reasoning_model(&req.model_id);
+    if !is_reasoning {
+        if let Some(t) = req.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(p) = req.top_p {
+            body["top_p"] = json!(p);
+        }
+    }
+
+    if let Some(m) = req.max_tokens {
+        body["max_output_tokens"] = json!(m);
+    }
+
+    // reasoning effort
+    let effort = match req.thinking_level.as_deref() {
+        Some("low") => Some("low"),
+        Some("medium") => Some("medium"),
+        Some("high") => Some("high"),
+        Some("max") => Some("xhigh"),
+        _ => None,
+    };
+    if let Some(effort) = effort {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+
+    // 工具定义转换为 Response API 格式
+    if let Some(tools) = &req.tools {
+        let tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                })
+            })
+            .collect();
+        body["tools"] = json!(tool_defs);
+    }
+
+    body
+}
+
+/// OpenAI Response API (/v1/responses) 请求构造
+fn build_openai_response_request(
+    ctx: &LlmContext,
+    req: &ChatRequest,
+    client: &reqwest::Client,
+) -> reqwest::RequestBuilder {
+    let body = build_openai_response_body(req);
+    let mut builder = client
+        .post(openai_responses_url(&ctx.provider.base_url))
+        .json(&body);
+    if let Some(key) = &ctx.api_key {
+        builder = builder.bearer_auth(key);
+    }
+    builder
+}
+
 pub async fn execute(
     ctx: LlmContext,
     req: ChatRequest,
     sink: &DeltaSink,
 ) -> Result<ChatResponse, String> {
-    use crate::models::ProviderType;
-
     let timeout_secs = ctx.provider.timeout.max(1) as u64;
     // 代理解析：供应商独立代理 > 全局代理 > 环境变量回退
     let (ptype, purl) = resolve_proxy(&ctx.provider, ctx.global_proxy.as_ref());
@@ -378,10 +517,7 @@ pub async fn execute(
         | ProviderType::Ollama
         | ProviderType::Custom => build_openai_request(&ctx, &req, &client),
         ProviderType::Anthropic => build_anthropic_request(&ctx, &req, &client),
-        // OpenAI Response API 转换在 Phase 2 引入
-        ProviderType::OpenAiResponse => {
-            return Err(err("UNSUPPORTED", "openai-response 格式将在 Phase 2 支持"));
-        }
+        ProviderType::OpenAiResponse => build_openai_response_request(&ctx, &req, &client),
     };
 
     let request = builder
@@ -406,13 +542,13 @@ pub async fn execute(
         return Err(classify_status(status, &body));
     }
 
-    let is_anthropic = ctx.provider.provider_type == ProviderType::Anthropic;
+    let p_type = ctx.provider.provider_type;
     let provider_name = ctx.provider.name.clone();
 
     let (content, reasoning, usage, tool_calls) = if req.stream {
-        stream_body(&ctx, resp, is_anthropic, timeout_secs, sink).await?
+        stream_body(&ctx, resp, p_type, timeout_secs, sink).await?
     } else {
-        full_body(&ctx, resp, is_anthropic).await?
+        full_body(&ctx, resp, p_type).await?
     };
 
     // 空响应作为可转移故障类型（§4.3 trigger: empty-response）
@@ -476,6 +612,10 @@ impl ToolAccumulator {
         &mut self.items[idx]
     }
 
+    fn set_arguments(&mut self, idx: usize, args: &str) {
+        self.ensure(idx).arguments = args.to_string();
+    }
+
     /// OpenAI 流式 delta：{ index, id?, function:{name?, arguments?} }
     fn apply_openai_delta(&mut self, delta: &Value) {
         let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) else {
@@ -531,7 +671,7 @@ impl ToolAccumulator {
 async fn stream_body(
     ctx: &LlmContext,
     resp: reqwest::Response,
-    is_anthropic: bool,
+    provider_type: ProviderType,
     idle_secs: u64,
     sink: &DeltaSink,
 ) -> Result<(String, Option<String>, Option<TokenUsage>, Vec<crate::models::ToolCall>), String> {
@@ -570,10 +710,16 @@ async fn stream_body(
             let line = String::from_utf8_lossy(&buf[start..end]);
             let line = line.trim();
             if !line.is_empty() {
-                if is_anthropic {
-                    handle_anthropic_line(line, &mut content, &mut reasoning, &mut usage, &mut tools, sink);
-                } else {
-                    handle_openai_line(line, &mut content, &mut reasoning, &mut usage, &mut tools, sink);
+                match provider_type {
+                    ProviderType::Anthropic => {
+                        handle_anthropic_line(line, &mut content, &mut reasoning, &mut usage, &mut tools, sink);
+                    }
+                    ProviderType::OpenAiResponse => {
+                        handle_openai_response_line(line, &mut content, &mut reasoning, &mut usage, &mut tools, sink);
+                    }
+                    _ => {
+                        handle_openai_line(line, &mut content, &mut reasoning, &mut usage, &mut tools, sink);
+                    }
                 }
             }
             start = end + 1;
@@ -592,6 +738,80 @@ fn non_empty(s: String) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// OpenAI Responses API 非流式响应解析：
+/// output 数组含 message（正文）/ reasoning（思考链）/ function_call（工具调用）三类条目，
+/// usage 为 input_tokens / output_tokens / total_tokens。
+fn parse_openai_response_body(
+    v: &Value,
+) -> (String, Option<String>, Option<TokenUsage>, Vec<crate::models::ToolCall>) {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tools: Vec<crate::models::ToolCall> = Vec::new();
+
+    if let Some(output) = v.get("output").and_then(Value::as_array) {
+        for item in output {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if item_type == "message" {
+                if let Some(parts) = item.pointer("/content").and_then(Value::as_array) {
+                    for p in parts {
+                        if p.get("type").and_then(Value::as_str) == Some("text")
+                            || p.get("type").and_then(Value::as_str) == Some("output_text")
+                        {
+                            if let Some(txt) = p.get("text").and_then(Value::as_str) {
+                                content.push_str(txt);
+                            }
+                        }
+                    }
+                }
+            } else if item_type == "reasoning" {
+                // 思考链：summary 摘要文本 + content 原始推理文本
+                for key in ["summary", "content"] {
+                    if let Some(parts) = item.get(key).and_then(Value::as_array) {
+                        for p in parts {
+                            if let Some(txt) = p.get("text").and_then(Value::as_str) {
+                                reasoning.push_str(txt);
+                            }
+                        }
+                    }
+                }
+            } else if item_type == "function_call" {
+                tools.push(crate::models::ToolCall {
+                    id: item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    arguments: item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}")
+                        .to_string(),
+                });
+            }
+        }
+    }
+    // 如果 output 为空，尝试常规解析（部分兼容端点仍回 Chat 形状）
+    if content.is_empty() {
+        if let Some(txt) = v.pointer("/choices/0/message/content").and_then(Value::as_str) {
+            content = txt.to_string();
+        }
+    }
+
+    let usage = v.get("usage").map(|u| {
+        let p = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let c = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+        TokenUsage {
+            prompt_tokens: p,
+            completion_tokens: c,
+            total_tokens: u.get("total_tokens").and_then(Value::as_i64).unwrap_or(p + c),
+        }
+    });
+
+    (content, non_empty(reasoning), usage, tools)
 }
 
 /// OpenAI 兼容 SSE：`data: {choices:[{delta:{content, reasoning_content, tool_calls}}]}` / `data: [DONE]`
@@ -718,10 +938,139 @@ pub(crate) fn handle_anthropic_line(
 
 // ---------- 非流式解析 ----------
 
+/// OpenAI Response API SSE 行处理
+pub(crate) fn handle_openai_response_line(
+    line: &str,
+    content: &mut String,
+    reasoning: &mut String,
+    usage: &mut Option<TokenUsage>,
+    tools: &mut ToolAccumulator,
+    sink: &DeltaSink,
+) {
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+
+    if let Some(u) = parse_usage(&v) {
+        *usage = Some(u);
+    }
+
+    let event_type = v.get("type").and_then(Value::as_str).unwrap_or("");
+    match event_type {
+        // 文本增量：response.output_text.delta 的 delta 是纯字符串
+        "response.output_text.delta" => {
+            if let Some(t) = v.get("delta").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    content.push_str(t);
+                    sink(t, None);
+                }
+            }
+        }
+        // 思考链增量：summary / raw reasoning 文本，delta 同样是纯字符串
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let Some(t) = v.get("delta").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    reasoning.push_str(t);
+                    sink("", Some(t));
+                }
+            }
+        }
+        // 工具调用参数增量：delta 为参数字符串片段
+        "response.function_call_arguments.delta" => {
+            if let Some(args) = v.get("delta").and_then(Value::as_str) {
+                let item_idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let fake_delta = json!({
+                    "tool_calls": [{
+                        "index": item_idx,
+                        "function": { "arguments": args }
+                    }]
+                });
+                tools.apply_openai_delta(&fake_delta);
+            }
+        }
+        // 工具项开始 (声明函数名和 call_id)
+        "response.output_item.added" => {
+            if let Some(item) = v.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let item_idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("");
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    let fake_delta = json!({
+                        "tool_calls": [{
+                            "index": item_idx,
+                            "id": call_id,
+                            "function": { "name": name, "arguments": "" }
+                        }]
+                    });
+                    tools.apply_openai_delta(&fake_delta);
+                }
+            }
+        }
+        // 工具项结束：done 携带完整 arguments，用替换而非追加（delta 已拼完时避免重复拼接）
+        "response.output_item.done" => {
+            if let Some(item) = v.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    if let Some(args) = item.get("arguments").and_then(Value::as_str) {
+                        if !args.is_empty() {
+                            let item_idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            tools.set_arguments(item_idx, args);
+                        }
+                    }
+                }
+            }
+        }
+        // 完成事件：usage 挂在 .response.usage 下（input_tokens / output_tokens / total_tokens）
+        "response.completed" => {
+            if let Some(u) = v.pointer("/response/usage") {
+                let p = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+                let c = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+                let total = u
+                    .get("total_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(p + c);
+                *usage = Some(TokenUsage {
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    total_tokens: total,
+                });
+            }
+        }
+        // 兜底通用 choices/delta (有些兼容端点即便路由在 /responses 也会回普通 chunk)
+        _ => {
+            if let Some(delta) = v.pointer("/choices/0/delta") {
+                if let Some(c) = delta.get("content").and_then(Value::as_str) {
+                    if !c.is_empty() {
+                        content.push_str(c);
+                        sink(c, None);
+                    }
+                }
+                let r_val = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .or_else(|| delta.get("thought"))
+                    .and_then(Value::as_str);
+                if let Some(r) = r_val {
+                    if !r.is_empty() {
+                        reasoning.push_str(r);
+                        sink("", Some(r));
+                    }
+                }
+                tools.apply_openai_delta(delta);
+            }
+        }
+    }
+}
 async fn full_body(
     ctx: &LlmContext,
     resp: reqwest::Response,
-    is_anthropic: bool,
+    provider_type: ProviderType,
 ) -> Result<(String, Option<String>, Option<TokenUsage>, Vec<crate::models::ToolCall>), String> {
     let _ = ctx;
     let v: Value = resp
@@ -729,7 +1078,7 @@ async fn full_body(
         .await
         .map_err(|e| err("SERVER", format!("解析响应失败: {e}")))?;
 
-    if is_anthropic {
+    if provider_type == ProviderType::Anthropic {
         // content 为块数组：拼接 text 块、thinking 块归入 reasoning、tool_use 收集
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -770,6 +1119,8 @@ async fn full_body(
                 u
             });
         Ok((content, non_empty(reasoning), usage, tools))
+    } else if provider_type == ProviderType::OpenAiResponse {
+        Ok(parse_openai_response_body(&v))
     } else {
         let content = v
             .pointer("/choices/0/message/content")
@@ -809,6 +1160,7 @@ async fn full_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ChatMessage;
 
     fn sink_capture() -> (DeltaSink, std::sync::Arc<std::sync::Mutex<String>>) {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -995,5 +1347,206 @@ mod tests {
 
         assert_eq!(reasoning, "深层思考再想想");
         assert_eq!(content, "");
+    }
+
+    #[test]
+    fn openai_response_api_sse_parses_delta_and_reasoning() {
+        let (sink, buf) = sink_capture();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut tools = ToolAccumulator::default();
+
+        // 官方事件样例：reasoning 摘要与正文增量的 delta 均为纯字符串
+        handle_openai_response_line(
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"思考中..."}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_text.delta","delta":"你好，世界！","item_id":"msg_1","output_index":0,"content_index":0}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line("data: [DONE]", &mut content, &mut reasoning, &mut usage, &mut tools, &sink);
+
+        assert_eq!(reasoning, "思考中...");
+        assert_eq!(content, "你好，世界！");
+        assert!(buf.lock().unwrap().contains("你好，世界！"));
+    }
+
+    #[test]
+    fn openai_response_api_sse_parses_tool_calls_and_usage() {
+        let (sink, _buf) = sink_capture();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut tools = ToolAccumulator::default();
+
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":""}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\"path\":\"a.txt\"}"}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+
+        let calls = tools.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.txt\"}");
+        let u = usage.expect("usage 应被解析");
+        assert_eq!(u.prompt_tokens, 11);
+        assert_eq!(u.completion_tokens, 7);
+        assert_eq!(u.total_tokens, 18);
+    }
+
+    #[test]
+    fn openai_response_api_sse_done_replaces_arguments() {
+        // 官方事件序列：delta 已拼完全部参数后，done 又携带完整 arguments，
+        // 必须替换而非追加，否则参数变成非法 JSON 导致工具拿不到参数
+        let (sink, _buf) = sink_capture();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut tools = ToolAccumulator::default();
+
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":""}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"path\":"}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"a.txt\"}"}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+
+        let calls = tools.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.txt\"}");
+    }
+
+    #[test]
+    fn openai_response_api_sse_done_only_arguments() {
+        // 部分端点不发 delta，只在 done 事件给出完整 arguments
+        let (sink, _buf) = sink_capture();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        let mut tools = ToolAccumulator::default();
+
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":""}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+        handle_openai_response_line(
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_abc","name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            &mut content, &mut reasoning, &mut usage, &mut tools, &sink,
+        );
+
+        let calls = tools.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.txt\"}");
+    }
+
+    #[test]
+    fn openai_response_input_uses_typed_entries() {
+        // 工具往返历史必须转成 Responses API 的类型化条目
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "读一下 a.txt".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_name: None,
+        }];
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(json!([
+                {"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}
+            ])),
+            tool_call_id: None,
+            tool_name: None,
+        });
+        messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: "文件内容".to_string(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            tool_name: Some("read_file".to_string()),
+        });
+
+        let req = ChatRequest {
+            request_id: "t".to_string(),
+            provider_id: "p".to_string(),
+            model_id: "gpt-5".to_string(),
+            messages,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            system: Some("你是助手".to_string()),
+            stream: false,
+            thinking_level: None,
+            session_id: None,
+            tools: None,
+        };
+
+        let body = build_openai_response_body(&req);
+        let input = body.get("input").and_then(|i| i.as_array()).unwrap();
+        // system + user + function_call + function_call_output
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0].get("type").and_then(Value::as_str), Some("message"));
+        assert_eq!(input[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(input[1].get("role").and_then(Value::as_str), Some("user"));
+        assert_eq!(input[2].get("type").and_then(Value::as_str), Some("function_call"));
+        assert_eq!(input[2].get("call_id").and_then(Value::as_str), Some("call_1"));
+        assert_eq!(input[2].get("name").and_then(Value::as_str), Some("read_file"));
+        assert_eq!(input[3].get("type").and_then(Value::as_str), Some("function_call_output"));
+        assert_eq!(input[3].get("call_id").and_then(Value::as_str), Some("call_1"));
+        assert_eq!(input[3].get("output").and_then(Value::as_str), Some("文件内容"));
+        // 不得残留 Chat Completions 专用字段
+        for item in input {
+            assert!(item.get("tool_calls").is_none());
+            assert!(item.get("tool_call_id").is_none());
+        }
+    }
+
+    #[test]
+    fn openai_response_full_body_parses_reasoning_and_usage() {
+        let body = json!({
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": [
+                    {"type": "summary_text", "text": "先看文件"}
+                ], "content": [{"type": "reasoning_text", "text": "再决定"}]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "好的"}
+                ]},
+                {"type": "function_call", "call_id": "call_9", "name": "read_file", "arguments": "{}"}
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+        });
+
+        let (content, reasoning, usage, tools) = parse_openai_response_body(&body);
+        assert_eq!(content, "好的");
+        assert_eq!(reasoning.as_deref(), Some("先看文件再决定"));
+        let u = usage.expect("usage 应被解析");
+        assert_eq!(u.prompt_tokens, 12);
+        assert_eq!(u.completion_tokens, 8);
+        assert_eq!(u.total_tokens, 20);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, "call_9");
     }
 }
