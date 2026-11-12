@@ -101,6 +101,17 @@ async function remove(s: SkillDef) {
 const sorted = computed(() =>
   [...store.skills].sort((a, b) => (a.source === 'builtin' ? -1 : 1) - (b.source === 'builtin' ? -1 : 1)),
 )
+
+/** 审阅框展示内容：优先 SKILL.md 正文；旧版 YAML 无正文时回退展示真正注入模型的步骤内容 */
+const trustContent = computed(() => {
+  const s = trustSkill.value
+  if (!s) return ''
+  if (s.body && s.body.trim()) return s.body
+  return s.steps
+    .map((st) => st.prompt || st.content || '')
+    .filter((x) => x.trim())
+    .join('\n\n')
+})
 </script>
 
 <template>
@@ -160,7 +171,7 @@ const sorted = computed(() =>
           </Button>
           <div class="ml-auto flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
             <Button
-              v-if="s.source === 'user'"
+              v-if="s.source === 'user' && s.body != null"
               variant="ghost"
               size="icon"
               class="size-7"
@@ -198,7 +209,7 @@ const sorted = computed(() =>
           <p class="text-sm text-muted-foreground">{{ t('skills.globalTrustHint') }}</p>
           <pre
             class="whitespace-pre-wrap rounded-lg border bg-muted/30 px-3 py-2 font-mono text-xs leading-5"
-          >{{ trustSkill?.body || t('skills.empty') }}</pre>
+          >{{ trustContent || t('skills.empty') }}</pre>
         </div>
         <DialogFooter class="pt-3">
           <Button variant="outline" @click="trustOpen = false">
